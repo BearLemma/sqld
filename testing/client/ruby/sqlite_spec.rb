@@ -24,4 +24,23 @@ describe "SQLite3 client" do
       puts results
     end
   end
+
+  it "inserts and reads some data using prepared stmt" do
+    db = SQLite3::Database.open db_uri
+    db.execute("CREATE TABLE IF NOT EXISTS users (username TEXT, pass TEXT)")
+    db.execute("DELETE FROM users")
+
+    # insert_stmt = db.prepare("INSERT INTO users (username, pass) VALUES ($1, $2)")
+    # insert_stmt.execute("Jan", "yes")
+    # insert_stmt.execute("Rudolf", "no")
+
+    select_stmt = db.prepare("SELECT username FROM users WHERE pass = $1")
+    raise "Unexpected number of stmt columns" unless select_stmt.columns == ["username"]
+
+    row = select_stmt.execute("yes").next
+    puts row
+
+    results = select_stmt.execute("no")
+    puts results
+  end
 end

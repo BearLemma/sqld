@@ -1,16 +1,17 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use fn_error_context::context as fn_context;
 use postgres_protocol::message::backend::DataRowBody;
 use postgres_protocol::message::{backend, frontend};
-use postgres_types::Type;
+use postgres_types::{BorrowToSql, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::prelude::*;
 use std::net::TcpStream;
 use tracing::trace;
 use url::Url;
 
+#[derive(Debug)]
 pub struct Metadata {
     pub col_names: Vec<String>,
     pub col_types: Vec<Type>,
@@ -26,6 +27,8 @@ impl Metadata {
         }
     }
 }
+
+#[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
     rx_buf: BytesMut,
@@ -60,20 +63,114 @@ impl Connection {
         Ok(())
     }
 
-    pub fn send_simple_query(&mut self, sql: &str) -> Result<()> {
+    pub fn send_parse(&mut self, sql: &str) -> Result<()> {
         let mut msg = BytesMut::new();
-        frontend::query(sql, &mut msg)?;
+        let param_types = vec![];
+        // FIXME: allocate a unique name for every statement and use it.
+        frontend::parse("", sql, param_types, &mut msg)?;
         self.stream.write_all(&msg)?;
         Ok(())
     }
 
-    pub fn wait_until_ready(&mut self) -> Result<(Metadata, VecDeque<DataRowBody>)> {
+    pub fn send_bind<P, I>(&mut self, params: I) -> Result<()>
+    where
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+    {
+        let mut msg = BytesMut::new();
+        let portal = "";
+        let statement = "";
+        let param_formats = vec![];
+        let param_types: Vec<Type> = vec![];
+        let params = params.into_iter();
+        frontend::bind(
+            &portal,
+            &statement,
+            param_formats,
+            params.zip(param_types).enumerate(),
+            |(_idx, (_param, _ty)), _buf| Ok(postgres_protocol::IsNull::No),
+            Some(1),
+            &mut msg,
+        )
+        .map_err(|_| anyhow!("bind failed"))?;
+        self.stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    pub fn send_describe(&mut self) -> Result<()> {
+        let mut msg = BytesMut::new();
+        frontend::describe('S' as u8, "", &mut msg)?;
+        self.stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    pub fn send_execute(&mut self) -> Result<()> {
+        let mut msg = BytesMut::new();
+        frontend::execute("", 0, &mut msg)?;
+        self.stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    pub fn send_flush(&mut self) -> Result<()> {
+        let mut msg = BytesMut::new();
+        frontend::flush(&mut msg);
+        self.stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    pub fn send_sync(&mut self) -> Result<()> {
+        let mut msg = BytesMut::new();
+        frontend::sync(&mut msg);
+        self.stream.write_all(&msg)?;
+        Ok(())
+    }
+
+    pub fn wait_until_parse_complete(&mut self) -> Result<()> {
+        loop {
+            let msg = self.receive_message()?;
+            match msg {
+                backend::Message::ParseComplete => {
+                    trace!("TRACE postgres -> ParseComplete");
+                    break;
+                }
+                _ => todo!(),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn wait_until_row_description(&mut self) -> Result<Metadata> {
+        loop {
+            let msg = self.receive_message()?;
+            match msg {
+                backend::Message::RowDescription(row_description) => {
+                    let mut metadata = Metadata::new();
+                    let mut fields = row_description.fields();
+                    while let Some(field) = fields.next().unwrap() {
+                        metadata.col_names.push(field.name().into());
+                        let ty = Type::from_oid(field.type_oid()).unwrap();
+                        metadata.col_types.push(ty);
+                    }
+                    return Ok(metadata);
+                }
+                backend::Message::ParameterDescription(_) => {
+                    trace!("TRACE postgres -> wait_until_row_description -> ParameterDescription");
+                }
+                backend::Message::NoData => {
+                    return Ok(Metadata::new());
+                }
+                _ => todo!(),
+            }
+        }
+    }
+
+    pub fn wait_until_ready(&mut self) -> Result<VecDeque<DataRowBody>> {
         let mut metadata = Metadata::new();
         let mut rows = VecDeque::default();
         loop {
             let msg = self.receive_message()?;
             if !self.process_msg(msg, &mut metadata, &mut rows)? {
-                return Ok((metadata, rows));
+                return Ok(rows);
             }
         }
     }
@@ -84,6 +181,9 @@ impl Connection {
             let msg = backend::Message::parse(&mut self.rx_buf)?;
             match msg {
                 Some(msg) => {
+                    if let backend::Message::ErrorResponse(body) = msg {
+                        anyhow::bail!(self.parse_err(body)?);
+                    }
                     return Ok(msg);
                 }
                 None => {
@@ -122,7 +222,9 @@ impl Connection {
             backend::Message::BackendKeyData(_) => {
                 trace!("TRACE postgres -> BackendKeyData");
             }
-            backend::Message::BindComplete => todo!(),
+            backend::Message::BindComplete => {
+                trace!("TRACE postgres -> BindComplete");
+            }
             backend::Message::CloseComplete => todo!(),
             backend::Message::CommandComplete(_) => {
                 trace!("TRACE postgres -> CommandComplete");
@@ -140,16 +242,24 @@ impl Connection {
                 trace!("TRACE postgres -> ErrorResponse");
                 anyhow::bail!(self.parse_err(body)?)
             }
-            backend::Message::NoData => todo!(),
+            backend::Message::NoData => {
+                trace!("TRACE postgres -> NoData");
+            }
             backend::Message::NoticeResponse(_) => {
                 trace!("TRACE postgres -> NoticeResponse");
             }
-            backend::Message::NotificationResponse(_) => todo!(),
-            backend::Message::ParameterDescription(_) => todo!(),
+            backend::Message::NotificationResponse(_) => {
+                trace!("TRACE postgres -> NotificationResponse");
+            }
+            backend::Message::ParameterDescription(_) => {
+                trace!("TRACE postgres -> ParameterDescription");
+            }
             backend::Message::ParameterStatus(_) => {
                 trace!("TRACE postgres -> ParameterStatus");
             }
-            backend::Message::ParseComplete => todo!(),
+            backend::Message::ParseComplete => {
+                trace!("TRACE postgres -> ParseComplete");
+            }
             backend::Message::PortalSuspended => todo!(),
             backend::Message::ReadyForQuery(_) => {
                 trace!("TRACE postgres -> ReadyForQuery");
@@ -193,7 +303,6 @@ impl Connection {
 
         let body = match self.receive_message()? {
             backend::Message::AuthenticationSaslContinue(body) => body,
-            backend::Message::ErrorResponse(body) => anyhow::bail!(self.parse_err(body)?),
             _ => anyhow::bail!(
                 "received unexpected message from server. Expected 'AuthenticationSaslContinue'.",
             ),
@@ -209,7 +318,6 @@ impl Connection {
         // Receive the last message from server.
         let body = match self.receive_message()? {
             backend::Message::AuthenticationSaslFinal(body) => body,
-            backend::Message::ErrorResponse(body) => anyhow::bail!(self.parse_err(body)?),
             _ => anyhow::bail!(
                 "received unexpected message from server. Expected 'AuthenticationSaslFinal'.",
             ),
