@@ -30,15 +30,19 @@ describe "SQLite3 client" do
     db.execute("CREATE TABLE IF NOT EXISTS users (username TEXT, pass TEXT)")
     db.execute("DELETE FROM users")
 
-    # insert_stmt = db.prepare("INSERT INTO users (username, pass) VALUES ($1, $2)")
-    # insert_stmt.execute("Jan", "yes")
-    # insert_stmt.execute("Rudolf", "no")
+    insert_stmt = db.execute("INSERT INTO users (username, pass) VALUES ('Jan', 'yes')")
+    insert_stmt = db.prepare("INSERT INTO users (username, pass) VALUES ($1, $2)")
+    insert_stmt.execute("Jan", "yes")
+    insert_stmt.execute("Rudolf", "no")
 
+    puts "==================="
+    puts "==================="
+    puts "==================="
     select_stmt = db.prepare("SELECT username FROM users WHERE pass = $1")
     raise "Unexpected number of stmt columns" unless select_stmt.columns == ["username"]
 
     row = select_stmt.execute("yes").next
-    puts row
+    puts "LOLOLOLO", row
 
     results = select_stmt.execute("no")
     puts results

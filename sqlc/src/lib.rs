@@ -7,8 +7,8 @@ mod postgres;
 
 use anyhow::Result;
 use fallible_iterator::FallibleIterator;
-use postgres::Metadata;
 use postgres_protocol::message::backend::DataRowBody;
+use safer_ffi::prelude::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
@@ -18,6 +18,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
 use tracing::trace;
 use unwrap_or::unwrap_ok_or;
+
+use crate::postgres::{sqlite3, BoundParam, Database, ParamValue, Statement, StatementState};
 
 thread_local! {
     static ERRMSG: RefCell<Option<CString>> = RefCell::new(None);
@@ -41,6 +43,10 @@ macro_rules! define_stub {
     };
 }
 
+fn to_database(db: *mut sqlite3) -> Rc<Database> {
+    unsafe { (*db).inner.clone() }
+}
+
 pub type sqlite3_int64 = i64;
 pub type sqlite3_uint64 = u64;
 
@@ -55,78 +61,6 @@ pub const SQLITE_LOCKED_SHAREDCACHE: c_int = SQLITE_LOCKED | (1 << 8);
 pub const SQLITE_TRANSIENT: c_int = -1;
 
 pub const SQLITE_UTF8: c_int = 1;
-
-struct Database {
-    conn: RefCell<postgres::Connection>,
-}
-
-impl Database {
-    fn new(conn: postgres::Connection) -> Self {
-        let conn = RefCell::new(conn);
-        Self { conn }
-    }
-}
-
-fn to_database(db: *mut sqlite3) -> Rc<Database> {
-    unsafe { (*db).inner.clone() }
-}
-
-pub struct sqlite3 {
-    inner: Rc<Database>,
-}
-
-impl sqlite3 {
-    fn connect(addr: &str) -> Result<Self> {
-        let mut conn = postgres::Connection::connect(addr)?;
-        conn.send_startup()?;
-        let rows = conn.wait_until_ready()?;
-        assert!(rows.is_empty());
-        let inner = Rc::new(Database::new(conn));
-        Ok(Self { inner })
-    }
-}
-
-impl Drop for sqlite3 {
-    fn drop(&mut self) {
-        trace!("TRACE drop sqlite3");
-    }
-}
-
-#[derive(Debug)]
-enum StatementState {
-    Prepared,
-    Rows,
-    Done,
-}
-
-struct Statement {
-    db: sqlite3,
-    sql: String,
-    state: StatementState,
-    metadata: Metadata,
-    current_row: Option<(DataRowBody, Vec<Option<Range<usize>>>)>,
-    rows: VecDeque<DataRowBody>,
-}
-
-impl Statement {
-    fn new(parent: Rc<Database>, sql: String, metadata: Metadata) -> Self {
-        let state = StatementState::Prepared;
-        let current_row = None;
-        let rows = VecDeque::default();
-        Self {
-            db: sqlite3 { inner: parent },
-            sql,
-            state,
-            metadata,
-            current_row,
-            rows,
-        }
-    }
-
-    fn parent_db(&self) -> &Rc<Database> {
-        &self.db.inner
-    }
-}
 
 fn to_stmt(stmt: *mut sqlite3_stmt) -> &'static mut Statement {
     unsafe { &mut (*stmt).inner }
@@ -318,35 +252,14 @@ pub extern "C" fn sqlite3_prepare_v2(
         return SQLITE_ERROR;
     });
     let sql = sql.to_string();
-    let database_ = database.clone();
-    let mut conn = database_.conn.borrow_mut();
-    unwrap_ok_or!(conn.send_parse(&sql), e, {
+    let mut conn = database.conn.borrow_mut();
+    let stmt = unwrap_ok_or!(conn.prepare_stmt(database.clone(), sql), e, {
         set_error_message(e);
         return SQLITE_ERROR;
     });
-    unwrap_ok_or!(conn.send_flush(), e, {
-        set_error_message(e);
-        return SQLITE_ERROR;
-    });
-    unwrap_ok_or!(conn.wait_until_parse_complete(), e, {
-        set_error_message(e);
-        return SQLITE_ERROR;
-    });
-    unwrap_ok_or!(conn.send_describe(), e, {
-        set_error_message(e);
-        return SQLITE_ERROR;
-    });
-    unwrap_ok_or!(conn.send_flush(), e, {
-        set_error_message(e);
-        return SQLITE_ERROR;
-    });
-    let metadata = unwrap_ok_or!(conn.wait_until_row_description(), e, {
-        set_error_message(e);
-        return SQLITE_ERROR;
-    });
+
+    let ptr = Box::new(sqlite3_stmt { inner: stmt });
     unsafe {
-        let stmt = Statement::new(database, sql, metadata);
-        let ptr = Box::new(sqlite3_stmt { inner: stmt });
         *ppStmt = Box::into_raw(ptr);
     }
     if !pzTail.is_null() {
@@ -367,6 +280,69 @@ pub extern "C" fn sqlite3_reset(_stmt: *mut sqlite3_stmt) -> c_int {
     SQLITE_OK
 }
 
+// define_stub!(sqlite3_exec);
+
+#[no_mangle]
+pub extern "C" fn sqlite3_exec(
+    db: *mut sqlite3,
+    raw_sql: *const c_char,
+    callback: Option<extern "C" fn(*mut (), c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>,
+    callback_1st_arg: *mut (),
+    _error_message: *mut *mut c_char,
+) -> c_int {
+    trace!("sqlite3_exec");
+    let database = to_database(db);
+
+    let raw_sql = unsafe { CStr::from_ptr(raw_sql) };
+    let sql = unwrap_ok_or!(raw_sql.to_str(), _, {
+        return SQLITE_ERROR;
+    })
+    .to_string();
+
+    let mut conn = database.conn.borrow_mut();
+    let mut stmt = unwrap_ok_or!(conn.prepare_stmt(database.clone(), sql), e, {
+        set_error_message(e);
+        return SQLITE_ERROR;
+    });
+
+    let bound_params = std::mem::replace(&mut stmt.bound_params, vec![]);
+    let rows = unwrap_ok_or!(conn.execute(bound_params), e, {
+        set_error_message(e);
+        return SQLITE_ERROR;
+    });
+
+    if let Some(callback) = callback {
+        let column_names: Vec<_> = stmt
+            .metadata
+            .col_names
+            .iter()
+            .map(|name| char_p::new(name.as_str()))
+            .collect();
+
+        for row in rows {
+            let column_ranges = parse_column_ranges(&row);
+            let mut data_columns = vec![];
+            for range in column_ranges {
+                if let Some(range) = range {
+                    let buf = &row.buffer()[range.clone()];
+                    data_columns.push(buf.as_ptr());
+                } else {
+                    // TODO: Set message
+                    return SQLITE_ERROR;
+                }
+            }
+            callback(
+                callback_1st_arg,
+                column_names.len() as i32,
+                column_names.as_ptr() as *mut *mut i8,
+                data_columns.as_ptr() as *mut *mut i8,
+            );
+        }
+    }
+
+    SQLITE_OK
+}
+
 /*
  * SQL evaluation.
  */
@@ -383,23 +359,12 @@ pub extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
         StatementState::Prepared => {
             let database = stmt.parent_db().clone();
             let mut conn = database.conn.borrow_mut();
-            let params: Vec<String> = vec![];
-            unwrap_ok_or!(conn.send_bind(params), e, {
+            let bound_params = std::mem::replace(&mut stmt.bound_params, vec![]);
+            let rows = unwrap_ok_or!(conn.execute(bound_params), e, {
                 set_error_message(e);
                 return SQLITE_ERROR;
             });
-            unwrap_ok_or!(conn.send_execute(), e, {
-                set_error_message(e);
-                return SQLITE_ERROR;
-            });
-            unwrap_ok_or!(conn.send_sync(), e, {
-                set_error_message(e);
-                return SQLITE_ERROR;
-            });
-            let rows = unwrap_ok_or!(conn.wait_until_ready(), e, {
-                set_error_message(e);
-                return SQLITE_ERROR;
-            });
+
             stmt.rows = rows;
             if let Some(row) = stmt.rows.pop_front() {
                 let column_ranges = parse_column_ranges(&row);
@@ -479,13 +444,25 @@ pub extern "C" fn sqlite3_bind_null(_stmt: *mut sqlite3_stmt, _idx: c_int) -> c_
 
 #[no_mangle]
 pub extern "C" fn sqlite3_bind_text(
-    _stmt: *mut sqlite3_stmt,
-    _idx: c_int,
-    _value: *const c_char,
-    _n: c_int,
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,           // Argument index
+    value: *const c_char, // Argument value
+    n: c_int, // Number of bytes contained in the value. If negative, value is zero-terminated
     _callback: extern "C" fn(*mut ()),
 ) -> c_int {
     trace!("STUB sqlite3_bind_text");
+    // TODO: Handle the callback parameter. It specifies how `value`'s lifetime should be
+    // handled
+    let stmt = to_stmt(stmt);
+    if n >= 0 {
+        let slice = unsafe { std::slice::from_raw_parts(value as *const u8, n as usize) };
+        stmt.bound_params.push(BoundParam {
+            index: idx as usize,
+            value: ParamValue::Text(String::from_utf8_lossy(slice).to_string()),
+        });
+    } else {
+        todo!();
+    }
     SQLITE_OK
 }
 
@@ -723,7 +700,6 @@ define_stub!(sqlite3_deserialize);
 define_stub!(sqlite3_drop_modules);
 define_stub!(sqlite3_enable_load_extension);
 define_stub!(sqlite3_enable_shared_cache);
-define_stub!(sqlite3_exec);
 define_stub!(sqlite3_expanded_sql);
 define_stub!(sqlite3_expired);
 define_stub!(sqlite3_extended_result_codes);
